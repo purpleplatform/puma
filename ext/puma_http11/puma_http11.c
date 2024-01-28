@@ -61,7 +61,7 @@ static VALUE global_request_path;
 #endif
 
 #ifndef PUMA_QUERY_STRING_MAX_LENGTH
-#define PUMA_QUERY_STRING_MAX_LENGTH (1024 * 10)
+#define PUMA_QUERY_STRING_MAX_LENGTH (1024 * 1024)
 #endif
 
 DEF_MAX_LENGTH(FIELD_NAME, 256);
