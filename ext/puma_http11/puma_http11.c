@@ -53,7 +53,7 @@ static VALUE global_request_path;
 
 /* Defines the maximum allowed lengths for various input elements.*/
 #ifndef PUMA_REQUEST_URI_MAX_LENGTH
-#define PUMA_REQUEST_URI_MAX_LENGTH (1024 * 12)
+#define PUMA_REQUEST_URI_MAX_LENGTH (1024 * 1281000)
 #endif
 
 #ifndef PUMA_REQUEST_PATH_MAX_LENGTH
@@ -65,7 +65,7 @@ static VALUE global_request_path;
 #endif
 
 DEF_MAX_LENGTH(FIELD_NAME, 256);
-DEF_MAX_LENGTH(FIELD_VALUE, 80 * 1024);
+DEF_MAX_LENGTH(FIELD_VALUE, 8000 * 1024);
 DEF_MAX_LENGTH(REQUEST_URI, PUMA_REQUEST_URI_MAX_LENGTH);
 DEF_MAX_LENGTH(FRAGMENT, 1024); /* Don't know if this length is specified somewhere or not */
 DEF_MAX_LENGTH(REQUEST_PATH, PUMA_REQUEST_PATH_MAX_LENGTH);
