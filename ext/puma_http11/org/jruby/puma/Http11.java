@@ -26,13 +26,13 @@ public class Http11 extends RubyObject {
     public final static String MAX_FIELD_NAME_LENGTH_ERR = "HTTP element FIELD_NAME is longer than the 256 allowed length.";
     public final static int MAX_FIELD_VALUE_LENGTH = 80 * 1024;
     public final static String MAX_FIELD_VALUE_LENGTH_ERR = "HTTP element FIELD_VALUE is longer than the 81920 allowed length.";
-    public final static int MAX_REQUEST_URI_LENGTH = 1024 * 12;
+    public final static int MAX_REQUEST_URI_LENGTH = 1024 * 12000;
     public final static String MAX_REQUEST_URI_LENGTH_ERR = "HTTP element REQUEST_URI is longer than the 12288 allowed length.";
     public final static int MAX_FRAGMENT_LENGTH = 1024;
     public final static String MAX_FRAGMENT_LENGTH_ERR = "HTTP element REQUEST_PATH is longer than the 1024 allowed length.";
     public final static int MAX_REQUEST_PATH_LENGTH = 8192;
     public final static String MAX_REQUEST_PATH_LENGTH_ERR = "HTTP element REQUEST_PATH is longer than the 8192 allowed length.";
-    public final static int MAX_QUERY_STRING_LENGTH = 1024 * 10;
+    public final static int MAX_QUERY_STRING_LENGTH = 1024 * 10000;
     public final static String MAX_QUERY_STRING_LENGTH_ERR = "HTTP element QUERY_STRING is longer than the 10240 allowed length.";
     public final static int MAX_HEADER_LENGTH = 1024 * (80 + 32);
     public final static String MAX_HEADER_LENGTH_ERR = "HTTP element HEADER is longer than the 114688 allowed length.";

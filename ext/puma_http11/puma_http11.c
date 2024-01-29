@@ -53,7 +53,7 @@ static VALUE global_request_path;
 
 /* Defines the maximum allowed lengths for various input elements.*/
 #ifndef PUMA_REQUEST_URI_MAX_LENGTH
-#define PUMA_REQUEST_URI_MAX_LENGTH (1024 * 1281000)
+#define PUMA_REQUEST_URI_MAX_LENGTH (1024 * 1280)
 #endif
 
 #ifndef PUMA_REQUEST_PATH_MAX_LENGTH
