@@ -12,4 +12,4 @@ jobs:
       subrepo_name: 'puma'
       subrepo_branch: ${{ github.ref_name }} # The branch that was pushed in this sub-repository
     secrets:
-      UNIFIED_REPO_TOKEN: ${{ secrets.SUBREPO_SYNC_TOKEN_FOR_UNIFIED_PUSH }}
+      UNIFIED_REPO_TOKEN: ${{ secrets.GH_ORGANIZATION_TOKEN }}
