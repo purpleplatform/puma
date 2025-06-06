@@ -1,0 +1,15 @@
+name: Sync to Unified Repository
+
+on:
+  push:
+    branches:
+      - '**' # Sync on push to any branch in this sub-repository
+
+jobs:
+  sync-to-unified:
+    uses: purpleplatform/docker-images/.github/workflows/sync-to-unified.yml@main
+    with:
+      subrepo_name: 'puma'
+      subrepo_branch: ${{ github.ref_name }} # The branch that was pushed in this sub-repository
+    secrets:
+      UNIFIED_REPO_TOKEN: ${{ secrets.GH_ORGANIZATION_TOKEN }}
