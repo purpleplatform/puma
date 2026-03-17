@@ -1,14 +1,17 @@
+# frozen_string_literal: true
+
 # Copyright (c) 2011 Evan Phoenix
 # Copyright (c) 2005 Zed A. Shaw
 
 require_relative "helper"
+require_relative "helpers/integration"
 require "digest"
 
 require "puma/puma_http11"
 
-class Http11ParserTest < Minitest::Test
+class Http11ParserTest < TestIntegration
 
-  parallelize_me!
+  parallelize_me! unless ::Puma::IS_JRUBY && RUBY_DESCRIPTION.include?('x86_64-darwin')
 
   def test_parse_simple
     parser = Puma::HttpParser.new
@@ -133,10 +136,63 @@ class Http11ParserTest < Minitest::Test
     if readable
       res << Digest(:SHA1).hexdigest(rand(count * 100).to_s) * (count / 40)
     else
-      res << Digest(:SHA1).digest(rand(count * 100).to_s) * (count / 20)
+      data = Digest(:SHA1).digest(rand(count * 100).to_s) * (count / 20)
+      # Guarantee there is an invalid byte at the end of the string
+      data.setbyte(data.bytesize - 1, 0x1)
+      res << data
     end
 
     res
+  end
+
+  def test_get_const_length
+    skip_unless :jruby
+
+    envs = %w[
+      PUMA_REQUEST_URI_MAX_LENGTH
+      PUMA_REQUEST_PATH_MAX_LENGTH
+      PUMA_QUERY_STRING_MAX_LENGTH
+    ]
+    default_exp = [1024 * 12, 8192, 10 * 1024]
+    tests = [{ envs: %w[60000 61000 62000], exp: [60000, 61000, 62000], error_indexes: [] },
+             { envs: ['', 'abc', nil], exp: default_exp, error_indexes: [1] },
+             { envs: %w[-4000 0 3000.45], exp: default_exp, error_indexes: [0, 1, 2] }]
+    cli_config = <<~CONFIG
+        app do |_|
+          [200, {}, [JSONSerialization.generate({
+                       MAX_REQUEST_URI_LENGTH:      org.jruby.puma.Http11::MAX_REQUEST_URI_LENGTH,
+                       MAX_REQUEST_PATH_LENGTH:     org.jruby.puma.Http11::MAX_REQUEST_PATH_LENGTH,
+                       MAX_QUERY_STRING_LENGTH:     org.jruby.puma.Http11::MAX_QUERY_STRING_LENGTH,
+                       MAX_REQUEST_URI_LENGTH_ERR:  org.jruby.puma.Http11::MAX_REQUEST_URI_LENGTH_ERR,
+                       MAX_REQUEST_PATH_LENGTH_ERR: org.jruby.puma.Http11::MAX_REQUEST_PATH_LENGTH_ERR,
+                       MAX_QUERY_STRING_LENGTH_ERR: org.jruby.puma.Http11::MAX_QUERY_STRING_LENGTH_ERR })]]
+        end
+    CONFIG
+
+    tests.each do |conf|
+      cli_server 'test/rackup/hello.ru',
+        env: {envs[0]  => conf[:envs][0], envs[1] => conf[:envs][1], envs[2] => conf[:envs][2]},
+        merge_err: true,
+        config: cli_config
+
+      sleep 0.25
+      result = JSON.parse read_body(connect)
+
+      assert_equal conf[:exp][0], result['MAX_REQUEST_URI_LENGTH']
+      assert_equal conf[:exp][1], result['MAX_REQUEST_PATH_LENGTH']
+      assert_equal conf[:exp][2], result['MAX_QUERY_STRING_LENGTH']
+
+      assert_includes result['MAX_REQUEST_URI_LENGTH_ERR'], "longer than the #{conf[:exp][0]} allowed length"
+      assert_includes result['MAX_REQUEST_PATH_LENGTH_ERR'], "longer than the #{conf[:exp][1]} allowed length"
+      assert_includes result['MAX_QUERY_STRING_LENGTH_ERR'], "longer than the #{conf[:exp][2]} allowed length"
+
+      conf[:error_indexes].each do |index|
+        assert_includes @server_log, "The value #{conf[:envs][index]} for #{envs[index]} is invalid. "\
+          "Using default value #{default_exp[index]} instead"
+      end
+
+      stop_server
+     end
   end
 
   def test_max_uri_path_length
@@ -155,8 +211,8 @@ class Http11ParserTest < Minitest::Test
     http = "GET #{path} HTTP/1.1\r\n\r\n"
     assert_raises Puma::HttpParserError do
       parser.execute(req, http, 0)
-      parser.reset
     end
+    parser.reset
   end
 
   def test_horrible_queries
@@ -167,8 +223,8 @@ class Http11ParserTest < Minitest::Test
       get = "GET /#{rand_data(10,120)} HTTP/1.1\r\nX-#{rand_data(1024, 1024+(c*1024))}: Test\r\n\r\n"
       assert_raises Puma::HttpParserError do
         parser.execute({}, get, 0)
-        parser.reset
       end
+      parser.reset
     end
 
     # then that large mangled field values are caught
@@ -176,32 +232,33 @@ class Http11ParserTest < Minitest::Test
       get = "GET /#{rand_data(10,120)} HTTP/1.1\r\nX-Test: #{rand_data(1024, 1024+(c*1024), false)}\r\n\r\n"
       assert_raises Puma::HttpParserError do
         parser.execute({}, get, 0)
-        parser.reset
       end
+      parser.reset
     end
 
     # then large headers are rejected too
-    get  = "GET /#{rand_data(10,120)} HTTP/1.1\r\n"
-    get += "X-Test: test\r\n" * (80 * 1024)
+    mult = TRUFFLE ? 10 : 80
+    get = "GET /#{rand_data(10,120)} HTTP/1.1\r\n" \
+      "#{"X-Test: test\r\n" * (mult * 1024)}"
     assert_raises Puma::HttpParserError do
       parser.execute({}, get, 0)
-      parser.reset
     end
+    parser.reset
 
     # finally just that random garbage gets blocked all the time
     10.times do |c|
       get = "GET #{rand_data(1024, 1024+(c*1024), false)} #{rand_data(1024, 1024+(c*1024), false)}\r\n\r\n"
       assert_raises Puma::HttpParserError do
         parser.execute({}, get, 0)
-        parser.reset
       end
+      parser.reset
     end
   end
 
   def test_trims_whitespace_from_headers
     parser = Puma::HttpParser.new
     req = {}
-    http = "GET / HTTP/1.1\r\nX-Strip-Me: Strip This       \r\n\r\n"
+    http = "GET / HTTP/1.1\r\nX-Strip-Me: \t Strip This \t      \r\n\r\n"
 
     parser.execute(req, http, 0)
 

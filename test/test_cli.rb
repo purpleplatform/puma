@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require_relative "helper"
 require_relative "helpers/ssl" if ::Puma::HAS_SSL
 require_relative "helpers/tmp_path"
@@ -7,7 +9,7 @@ require "puma/cli"
 require "json"
 require "psych"
 
-class TestCLI < Minitest::Test
+class TestCLI < PumaTest
   include SSLHelper if ::Puma::HAS_SSL
   include TmpPath
   include TestPuma::PumaSocket
@@ -26,7 +28,7 @@ class TestCLI < Minitest::Test
     @log_writer = Puma::LogWriter.strings
 
     @events = Puma::Events.new
-    @events.on_booted { @ready << "!" }
+    @events.after_booted { @ready << "!" }
 
     @puma_version_pattern = "\\d+.\\d+.\\d+(\\.[a-z\\d]+)?"
   end
@@ -46,6 +48,50 @@ class TestCLI < Minitest::Test
     @ready.close
   end
 
+  def check_single_stats(body, check_puma_stats = true)
+    http_hash = JSON.parse body
+
+    dmt = Puma::Configuration::DEFAULTS[:max_threads]
+
+    expected_single_root_keys = {
+      'started_at' => RE_8601,
+      'backlog'    => 0,
+      'running'    => 0,
+      'pool_capacity'  => dmt,
+      'busy_threads'   => 0,
+      'max_threads'    => dmt,
+      'requests_count' => 0,
+      'versions'       => Hash,
+    }
+
+    assert_hash expected_single_root_keys, http_hash
+
+    #version keys
+    expected_version_hash = {
+      'puma' => Puma::Const::VERSION,
+      'ruby' => Hash,
+    }
+    assert_hash expected_version_hash, http_hash['versions']
+
+    #version ruby keys
+    expected_version_ruby_hash = {
+      'engine'     => RUBY_ENGINE,
+      'version'    => RUBY_VERSION,
+      'patchlevel' => RUBY_PATCHLEVEL,
+    }
+
+    assert_hash expected_version_ruby_hash, http_hash['versions']['ruby']
+
+    if check_puma_stats
+      puma_stats_hash = JSON.parse(Puma.stats)
+      assert_hash expected_single_root_keys, puma_stats_hash
+      assert_hash expected_version_hash, puma_stats_hash['versions']
+      assert_hash expected_version_ruby_hash, puma_stats_hash['versions']['ruby']
+
+      assert_equal Puma.stats_hash, JSON.parse(Puma.stats, symbolize_names: true)
+    end
+  end
+
   def test_control_for_tcp
     control_port = UniquePort.call
     url = "tcp://127.0.0.1:#{control_port}/"
@@ -61,11 +107,8 @@ class TestCLI < Minitest::Test
 
     body = send_http_read_resp_body "GET /stats HTTP/1.0\r\n\r\n", port: control_port
 
-    assert_equal Puma.stats_hash, JSON.parse(Puma.stats, symbolize_names: true)
+    check_single_stats body
 
-    dmt = Puma::Configuration::DEFAULTS[:max_threads]
-    expected_stats = /\{"started_at":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z","backlog":0,"running":0,"pool_capacity":#{dmt},"max_threads":#{dmt},"requests_count":0,"versions":\{"puma":"#{@puma_version_pattern}","ruby":\{"engine":"\w+","version":"\d+.\d+.\d+","patchlevel":-?\d+\}\}\}/
-    assert_match(expected_stats, body)
   ensure
     cli.launcher.stop
     t.join
@@ -92,61 +135,14 @@ class TestCLI < Minitest::Test
     body = send_http_read_resp_body "GET /stats?token=#{token} HTTP/1.0\r\n\r\n",
       port: control_port, ctx: new_ctx
 
-    dmt = Puma::Configuration::DEFAULTS[:max_threads]
-    expected_stats = /{"started_at":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z","backlog":0,"running":0,"pool_capacity":#{dmt},"max_threads":#{dmt}/
-    assert_match(expected_stats, body)
+    check_single_stats body
   ensure
     # always called, even if skipped
     cli&.launcher&.stop
     t&.join
   end
 
-  def test_control_clustered
-    skip_unless :fork
-    skip_unless :unix
-    url = "unix://#{@tmp_path}"
-
-    cli = Puma::CLI.new ["-b", "unix://#{@tmp_path2}",
-                         "-t", "2:2",
-                         "-w", "2",
-                         "--control-url", url,
-                         "--control-token", "",
-                         "test/rackup/hello.ru"], @log_writer, @events
-
-    # without this, Minitest.after_run will trigger on this test ?
-    $debugging_hold = true
-
-    t = Thread.new { cli.run }
-
-    wait_booted
-
-    body = send_http_read_resp_body "GET /stats HTTP/1.0\r\n\r\n", path: @tmp_path
-
-    status = JSON.parse(body)
-
-    assert_equal 2, status["workers"]
-
-    body = send_http_read_resp_body "GET /stats HTTP/1.0\r\n\r\n", path: @tmp_path
-
-    expected_stats = /\{"started_at":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z","workers":2,"phase":0,"booted_workers":2,"old_workers":0,"worker_status":\[\{"started_at":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z","pid":\d+,"index":0,"phase":0,"booted":true,"last_checkin":"[^"]+","last_status":\{"backlog":0,"running":2,"pool_capacity":2,"max_threads":2,"requests_count":0\}\},\{"started_at":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z","pid":\d+,"index":1,"phase":0,"booted":true,"last_checkin":"[^"]+","last_status":\{"backlog":0,"running":2,"pool_capacity":2,"max_threads":2,"requests_count":0\}\}\],"versions":\{"puma":"#{@puma_version_pattern}","ruby":\{"engine":"\w+","version":"\d+.\d+.\d+","patchlevel":-?\d+\}\}\}/
-    assert_match(expected_stats, body)
-  ensure
-    if UNIX_SKT_EXIST && HAS_FORK
-      cli.launcher.stop
-      t.join
-
-      done = nil
-      until done
-        @log_writer.stdout.rewind
-        log = @log_writer.stdout.readlines.join ''
-        done = log[/ - Goodbye!/]
-      end
-
-      $debugging_hold = false
-    end
-  end
-
-  def test_control
+  def test_control_for_unix
     skip_unless :unix
     url = "unix://#{@tmp_path}"
 
@@ -161,9 +157,7 @@ class TestCLI < Minitest::Test
 
     body = send_http_read_resp_body "GET /stats HTTP/1.0\r\n\r\n", path: @tmp_path
 
-    dmt = Puma::Configuration::DEFAULTS[:max_threads]
-    expected_stats = /{"started_at":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z","backlog":0,"running":0,"pool_capacity":#{dmt},"max_threads":#{dmt},"requests_count":0,"versions":\{"puma":"#{@puma_version_pattern}","ruby":\{"engine":"\w+","version":"\d+.\d+.\d+","patchlevel":-?\d+\}\}\}/
-    assert_match(expected_stats, body)
+    check_single_stats body
   ensure
     if UNIX_SKT_EXIST
       cli.launcher.stop
@@ -340,50 +334,55 @@ class TestCLI < Minitest::Test
 
   def test_extra_runtime_dependencies
     cli = Puma::CLI.new ['--extra-runtime-dependencies', 'a,b']
-    extra_dependencies = cli.instance_variable_get(:@conf)
-                            .instance_variable_get(:@options)[:extra_runtime_dependencies]
+
+    conf = cli.instance_variable_get(:@conf)
+    conf.clamp
+
+    extra_dependencies = conf.options[:extra_runtime_dependencies]
 
     assert_equal %w[a b], extra_dependencies
   end
 
   def test_environment_app_env
-    ENV['RACK_ENV'] = @environment
-    ENV['RAILS_ENV'] = @environment
-    ENV['APP_ENV'] = 'test'
+    with_temp_env(
+      { "RACK_ENV": @environment },
+      { "RAILS_ENV": @environment, "APP_ENV": "test"
+    }) do
+      cli = Puma::CLI.new []
 
-    cli = Puma::CLI.new []
-    cli.send(:setup_options)
+      conf = cli.instance_variable_get(:@conf)
+      conf.clamp
 
-    assert_equal 'test', cli.instance_variable_get(:@conf).environment
-  ensure
-    ENV.delete 'APP_ENV'
-    ENV.delete 'RAILS_ENV'
+      assert_equal 'test', conf.environment
+    end
   end
 
   def test_environment_rack_env
     ENV['RACK_ENV'] = @environment
 
     cli = Puma::CLI.new []
-    cli.send(:setup_options)
 
-    assert_equal @environment, cli.instance_variable_get(:@conf).environment
+    conf = cli.instance_variable_get(:@conf)
+    conf.clamp
+
+    assert_equal @environment, conf.environment
   end
 
   def test_environment_rails_env
     ENV.delete 'RACK_ENV'
-    ENV['RAILS_ENV'] = @environment
 
-    cli = Puma::CLI.new []
-    cli.send(:setup_options)
+    with_temp_env({}, { "RAILS_ENV": @environment }) do
+      cli = Puma::CLI.new []
 
-    assert_equal @environment, cli.instance_variable_get(:@conf).environment
-  ensure
-    ENV.delete 'RAILS_ENV'
+      conf = cli.instance_variable_get(:@conf)
+      conf.clamp
+
+      assert_equal @environment, conf.environment
+    end
   end
 
   def test_silent
     cli = Puma::CLI.new ['--silent']
-    cli.send(:setup_options)
 
     log_writer = cli.instance_variable_get(:@log_writer)
 
@@ -395,10 +394,35 @@ class TestCLI < Minitest::Test
   def test_plugins
     assert_empty Puma::Plugins.instance_variable_get(:@plugins)
 
-    cli = Puma::CLI.new ['--plugin', 'tmp_restart', '--plugin', 'systemd']
-    cli.send(:setup_options)
+    Puma::CLI.new ['--plugin', 'tmp_restart', '--plugin', 'systemd']
 
     assert Puma::Plugins.find("tmp_restart")
     assert Puma::Plugins.find("systemd")
+  end
+
+  def test_config_does_not_preload_app_with_workers
+    skip_unless :fork
+
+    Puma::CLI.new ['-w 0']
+    config = Puma.cli_config
+
+    assert_equal false, config.options[:preload_app]
+  end
+
+  def test_config_preloads_app_with_workers
+    skip_unless :fork
+
+    Puma::CLI.new ['-w 2']
+    config = Puma.cli_config
+
+    assert_equal true, config.options[:preload_app]
+  end
+
+  def test_config_is_advertised_to_config_files
+    skip_unless :fork
+
+    Puma::CLI.new ['-w 2', '-C', File.expand_path('config/cli_config.rb', __dir__)]
+
+    assert_equal 4, Puma.cli_config._options[:workers]
   end
 end

@@ -1,7 +1,10 @@
 # frozen_string_literal: true
 
-# This module is used as an 'include' file in code at bottom of file
 module Puma
+
+  # This module is used as an 'include' file in code at bottom of file. It loads
+  # into either `Rackup::Handler::Puma` or `Rack::Handler::Puma`.
+
   module RackHandler
     DEFAULT_OPTIONS = {
       :Verbose => false,
@@ -29,7 +32,7 @@ module Puma
 
       @events = options[:events] || ::Puma::Events.new
 
-      conf = ::Puma::Configuration.new(options, default_options.merge({events: @events})) do |user_config, file_config, default_config|
+      conf = ::Puma::Configuration.new(options, default_options.merge({ events: @events })) do |user_config, file_config, default_config|
         if options.delete(:Verbose)
           begin
             require 'rack/commonlogger'  # Rack 1.x
@@ -69,7 +72,7 @@ module Puma
 
       log_writer = options.delete(:Silent) ? ::Puma::LogWriter.strings : ::Puma::LogWriter.stdio
 
-      launcher = ::Puma::Launcher.new(conf, :log_writer => log_writer, events: @events)
+      launcher = ::Puma::Launcher.new(conf, log_writer: log_writer, events: @events)
 
       yield launcher if block_given?
       begin
@@ -93,9 +96,9 @@ module Puma
     def set_host_port_to_config(host, port, config)
       config.clear_binds! if host || port
 
-      if host && (host[0,1] == '.' || host[0,1] == '/')
+      if host&.start_with? '.', '/', '@'
         config.bind "unix://#{host}"
-      elsif host && host =~ /^ssl:\/\//
+      elsif host&.start_with? 'ssl://'
         uri = URI.parse(host)
         uri.port ||= port || ::Puma::Configuration::DEFAULTS[:tcp_port]
         config.bind uri.to_s
@@ -115,7 +118,7 @@ module Puma
 end
 
 # rackup was removed in Rack 3, it is now a separate gem
-if Object.const_defined? :Rackup
+if Object.const_defined?(:Rackup) && ::Rackup.const_defined?(:Handler)
   module Rackup
     module Handler
       module Puma
@@ -127,7 +130,7 @@ if Object.const_defined? :Rackup
     end
   end
 else
-  do_register = Object.const_defined?(:Rack) && Rack.release < '3'
+  do_register = Object.const_defined?(:Rack) && ::Rack.release < '3'
   module Rack
     module Handler
       module Puma

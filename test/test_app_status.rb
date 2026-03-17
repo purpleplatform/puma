@@ -5,9 +5,7 @@ require_relative "helper"
 require "puma/app/status"
 require "rack"
 
-class TestAppStatus < Minitest::Test
-  parallelize_me!
-
+class TestAppStatus < PumaTest
   class FakeServer
     def initialize
       @status = :running
@@ -55,6 +53,14 @@ class TestAppStatus < Minitest::Test
     assert_equal 404, status
   end
 
+  def test_multiple_params
+    @app.instance_variable_set(:@auth_token, "abcdef")
+
+    status, _, _ = lint('/whatever?foo=bar&token=abcdef')
+
+    assert_equal 404, status
+  end
+
   def test_unsupported
     status, _, _ = lint('/not-real')
 
@@ -87,5 +93,24 @@ class TestAppStatus < Minitest::Test
   def test_alternate_location
     status, _ , _ = lint('__alternatE_location_/stats')
     assert_equal 200, status
+  end
+
+  def test_disabled_command
+    @app = Puma::App::Status.new(@server, data_only: true)
+
+    status, _ , app = lint('/stats')
+
+    assert_equal 200, status
+    assert_equal ['{}'], app.enum_for.to_a
+
+    status, _ , app = lint('/gc-stats')
+
+    assert_equal 200, status
+
+    status, _ , app = lint('/stop')
+
+    assert_equal :running, @server.status
+    assert_equal 404, status
+    assert_equal ['Command "stop" unavailable'], app.enum_for.to_a
   end
 end

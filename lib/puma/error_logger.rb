@@ -15,14 +15,14 @@ module Puma
 
     LOG_QUEUE = Queue.new
 
-    def initialize(ioerr)
+    def initialize(ioerr, env: ENV)
       @ioerr = ioerr
 
-      @debug = ENV.key? 'PUMA_DEBUG'
+      @debug = env.key?('PUMA_DEBUG')
     end
 
-    def self.stdio
-      new $stderr
+    def self.stdio(env: ENV)
+      new($stderr, env: env)
     end
 
     # Print occurred error details.
@@ -78,10 +78,12 @@ module Puma
     def request_title(req)
       env = req.env
 
+      query_string = env[QUERY_STRING]
+
       REQUEST_FORMAT % [
         env[REQUEST_METHOD],
         env[REQUEST_PATH] || env[PATH_INFO],
-        env[QUERY_STRING] || "",
+        query_string.nil? || query_string.empty? ? "" : "?#{query_string}",
         env[HTTP_X_FORWARDED_FOR] || env[REMOTE_ADDR] || "-"
       ]
     end

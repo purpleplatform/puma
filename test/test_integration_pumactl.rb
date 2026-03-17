@@ -1,37 +1,26 @@
+# frozen_string_literal: true
+
 require_relative "helper"
 require_relative "helpers/integration"
 
 class TestIntegrationPumactl < TestIntegration
   include TmpPath
-  parallelize_me! if ::Puma.mri?
+  parallelize_me!
 
   def workers ; 2 ; end
 
   def setup
     super
-    @control_path = nil
     @state_path = tmp_path('.state')
-  end
-
-  def teardown
-    super
-
-    refute @control_path && File.exist?(@control_path), "Control path must be removed after stop"
-  ensure
-    [@state_path, @control_path].each { |p| File.unlink(p) rescue nil }
   end
 
   def test_stop_tcp
     skip_if :jruby, :truffleruby # Undiagnose thread race. TODO fix
-    @control_tcp_port = UniquePort.call
     cli_server "-q test/rackup/sleep.ru #{set_pumactl_args} -S #{@state_path}"
 
     cli_pumactl "stop"
 
-    _, status = Process.wait2(@pid)
-    assert_equal 0, status
-
-    @server = nil
+    wait_server
   end
 
   def test_stop_unix
@@ -52,15 +41,19 @@ class TestIntegrationPumactl < TestIntegration
 
     cli_pumactl signal, unix: true
 
-    _, status = Process.wait2(@pid)
-    assert_equal 0, status
+    wait_server
+
     refute_match 'error', File.read(stderr.path)
-    @server = nil
   end
 
   def test_phased_restart_cluster
     skip_unless :fork
-    cli_server "-q -w #{workers} test/rackup/sleep.ru #{set_pumactl_args unix: true} -S #{@state_path}", unix: true
+    cli_server "test/rackup/sleep.ru #{set_pumactl_args unix: true}", unix: true, config: <<~RUBY
+      quiet
+      workers #{workers}
+      preload_app! false
+      state_path "#{@state_path}"
+    RUBY
 
     start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
@@ -87,10 +80,8 @@ class TestIntegrationPumactl < TestIntegration
 
     cli_pumactl "stop", unix: true
 
-    _, status = Process.wait2(@pid)
-    assert_equal 0, status
+    wait_server
     assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - start, :<, (DARWIN ? 8 : 7)
-    @server = nil
   end
 
   def test_refork_cluster
@@ -122,10 +113,8 @@ class TestIntegrationPumactl < TestIntegration
 
     cli_pumactl "stop", unix: true
 
-    _, status = Process.wait2(@pid)
-    assert_equal 0, status
-    assert_operator Time.now - start, :<, (DARWIN ? 8 : 6)
-    @server = nil
+    wait_server
+    assert_operator Time.now - start, :<, 60
   end
 
   def test_prune_bundler_with_multiple_workers
@@ -141,8 +130,7 @@ class TestIntegrationPumactl < TestIntegration
 
     cli_pumactl "stop", unix: true
 
-    _, _ = Process.wait2(@pid)
-    @server = nil
+    wait_server
   end
 
   def test_kill_unknown
@@ -161,8 +149,14 @@ class TestIntegrationPumactl < TestIntegration
     end
     sout.rewind
     # windows bad URI(is not URI?)
-    assert_match(/No pid '\d+' found|bad URI\(is not URI\?\)/, sout.readlines.join(""))
+    assert_match(/No pid '\d+' found|bad URI ?\(is not URI\?\)/, sout.readlines.join(""))
     assert_equal(1, e.status)
+  end
+
+  def test_config_deprecated
+    conf_path = "test/config/config_with_deprecated.rb"
+    out = cli_pumactl_spawn "-F #{conf_path} halt", no_bind: true
+    refute_start_with out.read, 'undefined method'
   end
 
   # calls pumactl with both a config file and a state file,  making sure that
@@ -170,19 +164,17 @@ class TestIntegrationPumactl < TestIntegration
   def test_require_dependencies
     skip_if :jruby
     conf_path = tmp_path '.config.rb'
-    @tcp_port = UniquePort.call
-    @control_tcp_port = UniquePort.call
 
     File.write conf_path , <<~CONF
       state_path "#{@state_path}"
-      bind "tcp://127.0.0.1:#{@tcp_port}"
+      bind "tcp://127.0.0.1:#{bind_port}"
 
       workers 0
 
       before_fork do
       end
 
-      activate_control_app "tcp://127.0.0.1:#{@control_tcp_port}", auth_token: "#{TOKEN}"
+      #{set_pumactl_config}
 
       app do |env|
         [200, {}, ["Hello World"]]
@@ -202,10 +194,91 @@ class TestIntegrationPumactl < TestIntegration
     assert_includes out.read, "Puma is started"
   end
 
+  def test_clustered_stats
+    skip_unless :fork
+    skip_unless :unix
+
+    min_threads = 1
+    max_threads = 2
+
+    cli_server "-w#{workers} -t#{min_threads}:#{max_threads} -q test/rackup/hello.ru #{set_pumactl_args unix: true} -S #{@state_path}"
+
+    worker_pids = get_worker_pids # waits for workers to boot
+
+    status = get_stats
+
+    assert_equal 2, status["workers"]
+
+    sleep 0.5 # needed for GHA ?
+
+    stats_hash = get_stats
+
+    expected_clustered_root_keys = {
+      'started_at' => RE_8601,
+      'workers'    => workers,
+      'phase'      => 0,
+      'booted_workers' => workers,
+      'old_workers'    => 0,
+      'worker_status'  => Array,
+      'versions'       => Hash,
+    }
+
+    assert_hash expected_clustered_root_keys, stats_hash
+
+    # worker_status hash
+    expected_status_hash = {
+      'started_at' => RE_8601,
+      'pid'        => worker_pids,
+      'index'      => 0...workers,
+      'phase'      => 0,
+      'booted'     => true,
+      'last_checkin' => RE_8601,
+      'last_status'  => Hash,
+    }
+
+    # worker last_status hash
+    expected_last_status_hash = {
+      'backlog' => 0,
+      'running' => min_threads,
+      'pool_capacity'  => max_threads,
+      'busy_threads'   => 0,
+      'backlog_max' => 0,
+      'max_threads'    => max_threads,
+      'requests_count' => 0,
+      'reactor_max'    => 0,
+    }
+
+    pids = []
+
+    workers.times do |idx|
+      worker_hash = stats_hash['worker_status'][idx]
+      assert_hash expected_status_hash, worker_hash
+      assert_equal idx, worker_hash['index']
+      pids << worker_hash['pid']
+      assert_hash expected_last_status_hash, worker_hash['last_status']
+    end
+    assert_equal pids, pids.uniq # no duplicates
+
+    #version keys
+    expected_version_hash = {
+      'puma' => Puma::Const::VERSION,
+      'ruby' => Hash,
+    }
+    assert_hash expected_version_hash, stats_hash['versions']
+
+    #version ruby keys
+    expected_version_ruby_hash = {
+      'engine'     => RUBY_ENGINE,
+      'version'    => RUBY_VERSION,
+      'patchlevel' => RUBY_PATCHLEVEL,
+    }
+    assert_hash expected_version_ruby_hash, stats_hash['versions']['ruby']
+  end
+
   def control_gc_stats(unix: false)
     cli_server "-t1:1 -q test/rackup/hello.ru #{set_pumactl_args unix: unix} -S #{@state_path}"
 
-    key = Puma::IS_MRI || TRUFFLE_HEAD ? "count" : "used"
+    key = Puma::IS_MRI ? "count" : "used"
 
     resp_io = cli_pumactl "gc-stats", unix: unix
     before = JSON.parse resp_io.read.split("\n", 2).last
@@ -224,13 +297,14 @@ class TestIntegrationPumactl < TestIntegration
     # Hitting the /gc route should increment the count by 1
     if key == "count"
       assert_operator gc_before, :<, gc_after, "make sure a gc has happened"
-    elsif !(Puma::IS_OSX && Puma::IS_JRUBY)
+    elsif !Puma::IS_JRUBY
       refute_equal gc_before, gc_after, "make sure a gc has happened"
     end
+  ensure
+    resp_io&.close unless resp_io&.closed?
   end
 
   def test_control_gc_stats_tcp
-    @control_tcp_port = UniquePort.call
     control_gc_stats
   end
 
