@@ -5,7 +5,6 @@ require 'socket'
 
 require_relative 'const'
 require_relative 'util'
-require_relative 'configuration'
 
 module Puma
 
@@ -19,22 +18,23 @@ module Puma
 
     RACK_VERSION = [1,6].freeze
 
-    def initialize(log_writer, conf = Configuration.new)
+    def initialize(log_writer, options, env: ENV)
       @log_writer = log_writer
-      @conf = conf
+      @options = options
       @listeners = []
       @inherited_fds = {}
       @activated_sockets = {}
       @unix_paths = []
+      @env = env
 
       @proto_env = {
         "rack.version".freeze => RACK_VERSION,
         "rack.errors".freeze => log_writer.stderr,
-        "rack.multithread".freeze => conf.options[:max_threads] > 1,
-        "rack.multiprocess".freeze => conf.options[:workers] >= 1,
+        "rack.multithread".freeze => options[:max_threads] > 1,
+        "rack.multiprocess".freeze => options[:workers] >= 1,
         "rack.run_once".freeze => false,
-        RACK_URL_SCHEME => conf.options[:rack_url_scheme],
-        "SCRIPT_NAME".freeze => ENV['SCRIPT_NAME'] || "",
+        RACK_URL_SCHEME => options[:rack_url_scheme],
+        "SCRIPT_NAME".freeze => env['SCRIPT_NAME'] || "",
 
         # I'd like to set a default CONTENT_TYPE here but some things
         # depend on their not being a default set and inferring
@@ -43,7 +43,10 @@ module Puma
 
         "QUERY_STRING".freeze => "",
         SERVER_SOFTWARE => PUMA_SERVER_STRING,
-        GATEWAY_INTERFACE => CGI_VER
+        GATEWAY_INTERFACE => CGI_VER,
+
+        RACK_AFTER_REPLY => nil,
+        RACK_RESPONSE_FINISHED => nil,
       }
 
       @envs = {}
@@ -87,7 +90,7 @@ module Puma
     # @version 5.0.0
     #
     def create_activated_fds(env_hash)
-      @log_writer.debug "ENV['LISTEN_FDS'] #{ENV['LISTEN_FDS'].inspect}  env_hash['LISTEN_PID'] #{env_hash['LISTEN_PID'].inspect}"
+      @log_writer.debug "ENV['LISTEN_FDS'] #{@env['LISTEN_FDS'].inspect}  env_hash['LISTEN_PID'] #{env_hash['LISTEN_PID'].inspect}"
       return [] unless env_hash['LISTEN_FDS'] && env_hash['LISTEN_PID'].to_i == $$
       env_hash['LISTEN_FDS'].to_i.times do |index|
         sock = TCPServer.for_fd(socket_activation_fd(index))
@@ -141,7 +144,14 @@ module Puma
       end
     end
 
+    def before_parse(&block)
+      @before_parse ||= []
+      @before_parse << block if block
+      @before_parse
+    end
+
     def parse(binds, log_writer = nil, log_msg = 'Listening')
+      before_parse.each(&:call)
       log_writer ||= @log_writer
       binds.each do |str|
         uri = URI.parse str
@@ -183,7 +193,7 @@ module Puma
             io = inherit_unix_listener path, fd
             log_writer.log "* Inherited #{str}"
           elsif sock = @activated_sockets.delete([ :unix, path ]) ||
-              @activated_sockets.delete([ :unix, File.realdirpath(path) ])
+              !abstract && @activated_sockets.delete([ :unix, File.realdirpath(path) ])
             @unix_paths << path unless abstract || File.exist?(path)
             io = inherit_unix_listener path, sock
             log_writer.log "* Activated #{str}"
@@ -235,7 +245,7 @@ module Puma
               cert_key.each do |v|
                 if params[v]&.start_with?('store:')
                   index = Integer(params.delete(v).split('store:').last)
-                  params["#{v}_pem"] = @conf.options[:store][index]
+                  params["#{v}_pem"] = @options[:store][index]
                 end
               end
               MiniSSL::ContextBuilder.new(params, @log_writer).context

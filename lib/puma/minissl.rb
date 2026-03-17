@@ -172,7 +172,6 @@ module Puma
             end
           end
         rescue IOError, SystemCallError
-          Puma::Util.purge_interrupt_queue
           # nothing
         ensure
           @socket.close
@@ -289,6 +288,7 @@ module Puma
         attr_reader :cert_pem
         attr_reader :key_pem
         attr_accessor :ssl_cipher_filter
+        attr_accessor :ssl_ciphersuites
         attr_accessor :verification_flags
 
         attr_reader :reuse, :reuse_cache_size, :reuse_timeout

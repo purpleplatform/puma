@@ -229,7 +229,7 @@ VALUE
 sslctx_initialize(VALUE self, VALUE mini_ssl_ctx) {
   SSL_CTX* ctx;
   int ssl_options;
-  VALUE key, cert, ca, verify_mode, ssl_cipher_filter, no_tlsv1, no_tlsv1_1,
+  VALUE key, cert, ca, verify_mode, ssl_cipher_filter, ssl_ciphersuites, no_tlsv1, no_tlsv1_1,
     verification_flags, session_id_bytes, cert_pem, key_pem, key_password_command, key_password;
   BIO *bio;
   X509 *x509 = NULL;
@@ -268,6 +268,8 @@ sslctx_initialize(VALUE self, VALUE mini_ssl_ctx) {
   verify_mode = rb_funcall(mini_ssl_ctx, rb_intern_const("verify_mode"), 0);
 
   ssl_cipher_filter = rb_funcall(mini_ssl_ctx, rb_intern_const("ssl_cipher_filter"), 0);
+
+  ssl_ciphersuites = rb_funcall(mini_ssl_ctx, rb_intern_const("ssl_ciphersuites"), 0);
 
   no_tlsv1 = rb_funcall(mini_ssl_ctx, rb_intern_const("no_tlsv1"), 0);
 
@@ -444,6 +446,14 @@ sslctx_initialize(VALUE self, VALUE mini_ssl_ctx) {
     SSL_CTX_set_cipher_list(ctx, "HIGH:!aNULL@STRENGTH");
   }
 
+#if HAVE_SSL_CTX_SET_CIPHERSUITES
+  // Only override OpenSSL default ciphersuites if config option is supplied.
+  if (!NIL_P(ssl_ciphersuites)) {
+    StringValue(ssl_ciphersuites);
+    SSL_CTX_set_ciphersuites(ctx, RSTRING_PTR(ssl_ciphersuites));
+  }
+#endif
+
 #if OPENSSL_VERSION_NUMBER < 0x10002000L
   // Remove this case if OpenSSL 1.0.1 (now EOL) support is no longer needed.
   ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
@@ -461,13 +471,8 @@ sslctx_initialize(VALUE self, VALUE mini_ssl_ctx) {
     SSL_CTX_set_verify(ctx, NUM2INT(verify_mode), engine_verify_callback);
   }
 
-  // Random.bytes available in Ruby 2.5 and later, Random::DEFAULT deprecated in 3.0
   session_id_bytes = rb_funcall(
-#ifdef HAVE_RANDOM_BYTES
     rb_cRandom,
-#else
-    rb_const_get(rb_cRandom, rb_intern_const("DEFAULT")),
-#endif
     rb_intern_const("bytes"),
     1, ULL2NUM(SSL_MAX_SSL_SESSION_ID_LENGTH));
 
@@ -655,14 +660,29 @@ VALUE engine_shutdown(VALUE self) {
 
   TypedData_Get_Struct(self, ms_conn, &engine_data_type, conn);
 
+  if (SSL_in_init(conn->ssl)) {
+    // Avoid "shutdown while in init" error
+    // See https://github.com/openssl/openssl/blob/openssl-3.5.2/ssl/ssl_lib.c#L2827-L2828
+    return Qtrue;
+  }
+
   ERR_clear_error();
 
   ok = SSL_shutdown(conn->ssl);
-  if (ok == 0) {
-    return Qfalse;
+  // See https://github.com/openssl/openssl/blob/openssl-3.5.2/ssl/ssl_lib.c#L2792-L2797
+  // for description of SSL_shutdown return values.
+  switch (ok) {
+    case 0:
+      // "close notify" alert is sent by us.
+      return Qfalse;
+    case 1:
+      // "close notify" alert was received from peer.
+      return Qtrue;
+    default:
+      raise_error(conn->ssl, ok);
   }
 
-  return Qtrue;
+  return Qnil;
 }
 
 VALUE engine_init(VALUE self) {

@@ -22,10 +22,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-20.04 , ruby: '2.7' }
-          - { os: ubuntu-20.04 , ruby: '3.2' }
+          - { os: ubuntu-22.04 , ruby: '3.2' }
           - { os: ubuntu-22.04 , ruby: '3.3' }
-          - { os: ubuntu-22.04 , ruby: head  }
+          - { os: ubuntu-22.04 , ruby: '3.4' }
+          - { os: ubuntu-24.04 , ruby: head  }
 
     env:
       BUNDLE_GEMFILE: gems/puma-head-rack-v3.rb
@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: checkout rack-conform
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: socketry/rack-conform
 
@@ -49,7 +49,9 @@ jobs:
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ matrix.ruby }}
+          rubygems: latest
           bundler-cache: true
+          cache-version: rack-conform
         timeout-minutes: 10
 
       - name: cat gems/puma-head-rack-v3.rb.lock

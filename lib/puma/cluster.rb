@@ -22,7 +22,8 @@ module Puma
       @workers = []
       @next_check = Time.now
 
-      @phased_restart = false
+      @worker_max = [] # keeps track of 'max' stat values
+      @pending_phased_restart = false
     end
 
     # Returns the list of cluster worker handles.
@@ -44,10 +45,14 @@ module Puma
       end
     end
 
-    def start_phased_restart
-      @events.fire_on_restart!
+    def start_phased_restart(refork = false)
+      @events.fire_before_restart!
       @phase += 1
-      log "- Starting phased worker restart, phase: #{@phase}"
+      if refork
+        log "- Starting worker refork, phase: #{@phase}"
+      else
+        log "- Starting phased worker restart, phase: #{@phase}"
+      end
 
       # Be sure to change the directory again before loading
       # the app. This way we can pick up new code.
@@ -82,11 +87,15 @@ module Puma
         end
 
         debug "Spawned worker: #{pid}"
-        @workers << WorkerHandle.new(idx, pid, @phase, @options)
+        @workers.insert(idx, WorkerHandle.new(idx, pid, @phase, @options))
       end
 
       if @options[:fork_worker] && all_workers_in_phase?
         @fork_writer << "0\n"
+
+        if worker_at(0).phase > 0
+          @fork_writer << "-2\n"
+        end
       end
     end
 
@@ -162,7 +171,7 @@ module Puma
       (@workers.map(&:pid) - idle_timed_out_worker_pids).empty?
     end
 
-    def check_workers
+    def check_workers(refork = false)
       return if @next_check >= Time.now
 
       @next_check = Time.now + @options[:worker_check_interval]
@@ -177,10 +186,15 @@ module Puma
         # we need to phase any workers out (which will restart
         # in the right phase).
         #
-        w = @workers.find { |x| x.phase != @phase }
+        w = @workers.find { |x| x.phase < @phase }
 
         if w
-          log "- Stopping #{w.pid} for phased upgrade..."
+          if refork
+            log "- Stopping #{w.pid} for refork..."
+          else
+            log "- Stopping #{w.pid} for phased upgrade..."
+          end
+
           unless w.term?
             w.term
             log "- #{w.signal} sent to #{w.pid}..."
@@ -207,12 +221,11 @@ module Puma
         pipes[:wakeup] = @wakeup
       end
 
-      server = start_server if preload?
       new_worker = Worker.new index: index,
                               master: master,
                               launcher: @launcher,
                               pipes: pipes,
-                              server: server
+                              app: (app if preload?)
       new_worker.run
     end
 
@@ -224,7 +237,7 @@ module Puma
     def phased_restart(refork = false)
       return false if @options[:preload_app] && !refork
 
-      @phased_restart = true
+      @pending_phased_restart = refork ? :refork : true
       wakeup!
 
       true
@@ -254,11 +267,14 @@ module Puma
     end
 
     # Inside of a child process, this will return all zeroes, as @workers is only populated in
-    # the master process.
+    # the master process.  Calling this also resets stat 'max' values to zero.
     # @!attribute [r] stats
+    # @return [Hash]
+
     def stats
       old_worker_count = @workers.count { |w| w.phase != @phase }
       worker_status = @workers.map do |w|
+        w.reset_max
         {
           started_at: utc_iso8601(w.started_at),
           pid: w.pid,
@@ -269,7 +285,6 @@ module Puma
           last_status: w.last_status,
         }
       end
-
       {
         started_at: utc_iso8601(@started_at),
         workers: @workers.size,
@@ -338,7 +353,7 @@ module Puma
 
           stop_workers
           stop
-          @events.fire_on_stopped!
+          @events.fire_after_stopped!
           raise(SignalException, "SIGTERM") if @options[:raise_exception_on_sigterm]
           exit 0 # Clean exit, workers were stopped
         end
@@ -348,8 +363,6 @@ module Puma
     def run
       @status = :run
 
-      @idle_workers = {}
-
       output_header "cluster"
 
       # This is aligned with the output from Runner, see Runner#output_header
@@ -357,16 +370,12 @@ module Puma
 
       if preload?
         # Threads explicitly marked as fork safe will be ignored. Used in Rails,
-        # but may be used by anyone. Note that we need to explicit
-        # Process::Waiter check here because there's a bug in Ruby 2.6 and below
-        # where calling thread_variable_get on a Process::Waiter will segfault.
-        # We can drop that clause once those versions of Ruby are no longer
-        # supported.
-        fork_safe = ->(t) { !t.is_a?(Process::Waiter) && t.thread_variable_get(:fork_safe) }
+        # but may be used by anyone.
+        fork_safe = ->(t) { t.thread_variable_get(:fork_safe) }
 
         before = Thread.list.reject(&fork_safe)
 
-        log "*     Restarts: (\u2714) hot (\u2716) phased"
+        log "*     Restarts: (\u2714) hot (\u2716) phased (#{@options[:fork_worker] ? "\u2714" : "\u2716"}) refork"
         log "* Preloading application"
         load_and_bind
 
@@ -384,7 +393,7 @@ module Puma
           end
         end
       else
-        log "*     Restarts: (\u2714) hot (\u2714) phased"
+        log "*     Restarts: (\u2714) hot (\u2714) phased (#{@options[:fork_worker] ? "\u2714" : "\u2716"}) refork"
 
         unless @config.app_configured?
           error "No application configured, nothing to run"
@@ -411,6 +420,7 @@ module Puma
 
       log "Use Ctrl-C to stop"
 
+      warn_ruby_mn_threads
       single_worker_warning
 
       redirect_io
@@ -440,25 +450,29 @@ module Puma
 
         while @status == :run
           begin
-            if all_workers_idle_timed_out?
+            if @options[:idle_timeout] && all_workers_idle_timed_out?
               log "- All workers reached idle timeout"
               break
             end
 
-            if @phased_restart
-              start_phased_restart
-              @phased_restart = false
-              in_phased_restart = true
+            if @pending_phased_restart
+              start_phased_restart(@pending_phased_restart == :refork)
+
+              in_phased_restart = @pending_phased_restart
+              @pending_phased_restart = false
+
               workers_not_booted = @options[:workers]
+              # worker 0 is not restarted on refork
+              workers_not_booted -= 1 if in_phased_restart == :refork
             end
 
-            check_workers
+            check_workers(in_phased_restart == :refork)
 
             if read.wait_readable([0, @next_check - Time.now].max)
               req = read.read_nonblock(1)
               next unless req
 
-              if req == Puma::Const::PipeRequest::WAKEUP
+              if req == PIPE_WAKEUP
                 @next_check = Time.now
                 next
               end
@@ -466,7 +480,7 @@ module Puma
               result = read.gets
               pid = result.to_i
 
-              if req == Puma::Const::PipeRequest::BOOT || req == Puma::Const::PipeRequest::FORK
+              if req == PIPE_BOOT || req == PIPE_FORK
                 pid, idx = result.split(':').map(&:to_i)
                 w = worker_at idx
                 w.pid = pid if w.pid.nil?
@@ -474,36 +488,36 @@ module Puma
 
               if w = @workers.find { |x| x.pid == pid }
                 case req
-                when Puma::Const::PipeRequest::BOOT
+                when PIPE_BOOT
                   w.boot!
                   log "- Worker #{w.index} (PID: #{pid}) booted in #{w.uptime.round(2)}s, phase: #{w.phase}"
                   @next_check = Time.now
                   workers_not_booted -= 1
-                when Puma::Const::PipeRequest::EXTERNAL_TERM
+                when PIPE_EXTERNAL_TERM
                   # external term, see worker method, Signal.trap "SIGTERM"
                   w.term!
-                when Puma::Const::PipeRequest::TERM
+                when PIPE_TERM
                   w.term unless w.term?
-                when Puma::Const::PipeRequest::PING
+                when PIPE_PING
                   status = result.sub(/^\d+/,'').chomp
                   w.ping!(status)
                   @events.fire(:ping!, w)
 
-                  if in_phased_restart && workers_not_booted.positive? && w0 = worker_at(0)
+                  if in_phased_restart && @options[:fork_worker] && workers_not_booted.positive? && w0 = worker_at(0)
                     w0.ping!(status)
                     @events.fire(:ping!, w0)
                   end
 
                   if !booted && @workers.none? {|worker| worker.last_status.empty?}
-                    @events.fire_on_booted!
+                    @events.fire_after_booted!
                     debug_loaded_extensions("Loaded Extensions - master:") if @log_writer.debug?
                     booted = true
                   end
-                when Puma::Const::PipeRequest::IDLE
-                  if @idle_workers[pid]
-                    @idle_workers.delete pid
+                when PIPE_IDLE
+                  if idle_workers[pid]
+                    idle_workers.delete pid
                   else
-                    @idle_workers[pid] = true
+                    idle_workers[pid] = true
                   end
                 end
               else
@@ -512,7 +526,7 @@ module Puma
             end
 
             if in_phased_restart && workers_not_booted.zero?
-              @events.fire_on_booted!
+              @events.fire_after_booted!
               debug_loaded_extensions("Loaded Extensions - master:") if @log_writer.debug?
               in_phased_restart = false
             end
@@ -568,7 +582,9 @@ module Puma
           #    `Process.wait2(-1)` from detecting a terminated process: https://bugs.ruby-lang.org/issues/19837.
           # 2. When `fork_worker` is enabled, some worker may not be direct children,
           #    but grand children.  Because of this they won't be reaped by `Process.wait2(-1)`.
-          if reaped_children.delete(w.pid) || Process.wait(w.pid, Process::WNOHANG)
+          if (status = reaped_children.delete(w.pid) || Process.wait2(w.pid, Process::WNOHANG)&.last)
+            w.process_status = status
+            @config.run_hooks(:after_worker_shutdown, w, @log_writer)
             true
           else
             w.term if w.term?
@@ -608,7 +624,11 @@ module Puma
     end
 
     def idle_timed_out_worker_pids
-      @idle_workers.keys
+      idle_workers.keys
+    end
+
+    def idle_workers
+      @idle_workers ||= {}
     end
   end
 end

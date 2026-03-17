@@ -2,13 +2,10 @@
 # Copyright (c) 2011 Evan Phoenix
 # Copyright (c) 2005 Zed A. Shaw
 
-if RUBY_VERSION == '2.4.1'
-  begin
-    require 'stopgap_13632'
-  rescue LoadError
-    puts "For test stability, you must install the stopgap_13632 gem."
-    exit(1)
-  end
+# WIth GitHub Actions, OS's `/tmp` folder may be on a HDD, while
+# ENV['RUNNER_TEMP'] is an SSD.  Faster.
+if ENV['GITHUB_ACTIONS'] == 'true'
+  ENV['TMPDIR'] = ENV['RUNNER_TEMP']
 end
 
 require "securerandom"
@@ -18,16 +15,14 @@ require "minitest/autorun"
 require "minitest/pride"
 require "minitest/proveit"
 require "minitest/stub_const"
+require "minitest/mock" unless defined?(::Minitest::Mock)
 require "net/http"
 require_relative "helpers/apps"
+require_relative "helpers/test_puma/assertions"
 
 Thread.abort_on_exception = true
 
 $debugging_info = []
-$debugging_hold = false   # needed for TestCLI#test_control_clustered
-$test_case_timeout = ENV.fetch("TEST_CASE_TIMEOUT") do
-  RUBY_ENGINE == "ruby" ? 45 : 60
-end.to_i
 
 require "puma"
 require "puma/detect"
@@ -41,10 +36,15 @@ end
 if Puma::HAS_SSL
   require 'puma/log_writer'
   class SSLLogWriterHelper < ::Puma::LogWriter
-    attr_accessor :addr, :cert, :error
+    attr_accessor :addr, :cert
+    attr_reader :errors
+
+    def error
+      @errors&.last
+    end
 
     def ssl_error(error, ssl_socket)
-      self.error = error
+      (@errors ||= []) << error
       self.addr = ssl_socket.peeraddr.last rescue "<unknown>"
       self.cert = ssl_socket.peercert
     end
@@ -69,56 +69,52 @@ def hit(uris)
 end
 
 module UniquePort
+  # below is similar to `Addrinfo.bind`, but sets `REUSEADDR` off and
+  # comments out `sock.ipv6only!`
   def self.call(host = '127.0.0.1')
-    TCPServer.open(host, 0) do |server|
-      server.connect_address.ip_port
-    end
+    addr_info = Addrinfo.tcp host, 0
+    sock = Socket.new addr_info.pfamily, :STREAM
+    # sock.ipv6only! if addr_info.ipv6?
+    sock.setsockopt :SOCKET, :REUSEADDR, 0
+    sock.bind addr_info
+    sock.connect_address.ip_port
+  rescue Exception => e
+    raise e
+  ensure
+    sock&.close unless sock&.closed?
   end
 end
 
 require "timeout"
-module TimeoutEveryTestCase
+
+module TimeoutPrepend
+  TEST_CASE_TIMEOUT = ENV.fetch("TEST_CASE_TIMEOUT") do
+    RUBY_ENGINE == "ruby" ? 45 : 60
+  end.to_i
+
   # our own subclass so we never confuse different timeouts
   class TestTookTooLong < Timeout::Error
   end
 
-  def run
-    with_info_handler do
-      time_it do
-        capture_exceptions do
-          ::Timeout.timeout($test_case_timeout, TestTookTooLong) do
-            before_setup; setup; after_setup
-            self.send self.name
-          end
-        end
-
-        capture_exceptions do
-          ::Timeout.timeout($test_case_timeout, TestTookTooLong) do
-            Minitest::Test::TEARDOWN_METHODS.each { |hook| self.send hook }
-          end
-        end
-        if respond_to? :clean_tmp_paths
-          clean_tmp_paths
-        end
-      end
+  def capture_exceptions
+    super do
+      ::Timeout.timeout(TEST_CASE_TIMEOUT, TestTookTooLong) { yield }
     end
-
-    Minitest::Result.from self # per contract
   end
 end
 
-Minitest::Test.prepend TimeoutEveryTestCase
+Minitest::Test.prepend TimeoutPrepend
 
 if ENV['CI']
   require 'minitest/retry'
 
-  SUMMARY_FILE = ENV['GITHUB_STEP_SUMMARY']
+  Minitest::Retry::GHA_STEP_SUMMARY_FILE = ENV['GITHUB_STEP_SUMMARY']
 
   Minitest::Retry.use!
 
-  if SUMMARY_FILE && ENV['GITHUB_ACTIONS'] == 'true'
+  if Minitest::Retry::GHA_STEP_SUMMARY_FILE && ENV['GITHUB_ACTIONS'] == 'true'
 
-    GITHUB_STEP_SUMMARY_MUTEX = Mutex.new
+    Minitest::Retry::GHA_STEP_SUMMARY_MUTEX = Mutex.new
 
     Minitest::Retry.on_failure do |klass, test_name, result|
       full_method = "#{klass}##{test_name}"
@@ -132,8 +128,17 @@ if ENV['CI']
       # remove indent
       result_str.gsub!(/^ +/, '')
       str = "\n**#{full_method}**\n**#{issue}**\n```\n#{result_str.strip}\n```\n"
-      GITHUB_STEP_SUMMARY_MUTEX.synchronize {
-        File.write SUMMARY_FILE, str, mode: 'a+'
+      Minitest::Retry::GHA_STEP_SUMMARY_MUTEX.synchronize {
+        retry_cntr = 0
+        begin
+          File.write Minitest::Retry::GHA_STEP_SUMMARY_FILE, str, mode: 'a+'
+        rescue IOError # can't write to file, retry once
+          if retry_cntr == 0
+            retry_cntr += 1
+            sleep 0.2
+            retry
+          end
+        end
       }
     end
   end
@@ -159,7 +164,7 @@ module TestSkips
 
   # usage: skip_unless_signal_exist? :USR2
   def skip_unless_signal_exist?(sig, bt: caller)
-    signal = sig.to_s.sub(/\ASIG/, '').to_sym
+    signal = sig.to_s.delete_prefix('SIG').to_sym
     unless SIGNAL_LIST.include? signal
       skip "Signal #{signal} isn't available on the #{RUBY_PLATFORM} platform", bt
     end
@@ -169,6 +174,7 @@ module TestSkips
   # optional suffix kwarg is appended to the skip message
   # optional suffix bt should generally not used
   def skip_if(*engs, suffix: '', bt: caller)
+    skip_msg = nil
     engs.each do |eng|
       skip_msg = case eng
         when :linux       then "Skipped if Linux#{suffix}"       if Puma::IS_LINUX
@@ -183,9 +189,10 @@ module TestSkips
         when :unix        then "Skipped if UNIXSocket exists"    if Puma::HAS_UNIX_SOCKET
         when :aunix       then "Skipped if abstract UNIXSocket"  if Puma.abstract_unix_socket?
         when :rack3       then "Skipped if Rack 3.x"             if Rack.release >= '3'
-        else false
+        when :oldwindows  then "Skipped if old Windows"          if Puma::IS_WINDOWS && RUBY_VERSION < '2.6'
+        else nil
       end
-      skip skip_msg, bt if skip_msg
+      skip(skip_msg, bt) if skip_msg
     end
   end
 
@@ -208,25 +215,8 @@ module TestSkips
   end
 end
 
-Minitest::Test.include TestSkips
-
-class Minitest::Test
-
-  PROJECT_ROOT = File.dirname(__dir__)
-
-  def self.run(reporter, options = {}) # :nodoc:
-    prove_it!
-    super
-  end
-
-  def full_name
-    "#{self.class.name}##{name}"
-  end
-end
-
 Minitest.after_run do
-  # needed for TestCLI#test_control_clustered
-  if !$debugging_hold && ENV['PUMA_TEST_DEBUG']
+  if ENV['PUMA_TEST_DEBUG']
     $debugging_info.sort!
     out = $debugging_info.join.strip
     unless out.empty?
@@ -301,8 +291,76 @@ module TestTempFile
     fio.write data
     fio.flush
     fio.rewind
-    @ios << fio
+    @ios << fio if defined?(@ios)
+    @ios_to_close << fio if defined?(@ios_to_close)
     fio
   end
 end
-Minitest::Test.include TestTempFile
+
+# This module is modified based on https://github.com/rails/rails/blob/7-1-stable/activesupport/lib/active_support/testing/method_call_assertions.rb
+module MethodCallAssertions
+  def assert_called_on_instance_of(klass, method_name, message = nil, times: 1, returns: nil)
+    times_called = 0
+    klass.send(:define_method, :"stubbed_#{method_name}") do |*|
+      times_called += 1
+
+      returns
+    end
+
+    klass.send(:alias_method, :"original_#{method_name}", method_name)
+    klass.send(:alias_method, method_name, :"stubbed_#{method_name}")
+
+    yield
+
+    error = "Expected #{method_name} to be called #{times} times, but was called #{times_called} times"
+    error = "#{message}.\n#{error}" if message
+
+    assert_equal times, times_called, error
+  ensure
+    klass.send(:alias_method, method_name, :"original_#{method_name}")
+    klass.send(:undef_method, :"original_#{method_name}")
+    klass.send(:undef_method, :"stubbed_#{method_name}")
+  end
+
+  def assert_not_called_on_instance_of(klass, method_name, message = nil, &block)
+    assert_called_on_instance_of(klass, method_name, message, times: 0, &block)
+  end
+end
+
+class PumaTest < Minitest::Test # rubocop:disable Puma/TestsMustUsePumaTest
+  include MethodCallAssertions
+  include TestPuma::Assertions
+  include TestSkips
+  include TestTempFile
+
+  prove_it!
+
+  PROJECT_ROOT = File.dirname(__dir__)
+
+  def teardown
+    clean_tmp_paths if respond_to? :clean_tmp_paths
+  end
+
+  def full_name
+    "#{self.class.name}##{name}"
+  end
+
+
+  def with_temp_env(temp_env, del_env={}, &block)
+    original_env = {}
+
+    temp_env.transform_keys(&:to_s).each do |k, v|
+      original_env[k], ENV[k] = ENV[k], v
+    end
+
+    del_env.transform_keys(&:to_s).each { |k, v| ENV[k] = v }
+
+    yield
+  ensure
+    # Restore original values
+    original_env.each { |k, v| ENV[k] = v }
+
+    # Remove keys that were added via del_env
+    del_env.transform_keys(&:to_s).each { |k, _| ENV.delete(k) }
+  end
+end
