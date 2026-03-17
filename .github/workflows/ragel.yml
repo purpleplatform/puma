@@ -1,6 +1,13 @@
 name: ragel
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches-ignore:
+      - 'sync/upstream-*'
+  pull_request:
+    branches-ignore:
+      - 'sync/upstream-*'
+  workflow_dispatch:
 
 permissions:
   contents: read # to fetch code (actions/checkout)
