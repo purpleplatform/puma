@@ -98,7 +98,24 @@ module Puma
           end
         end
 
+        # Only the first SIGTERM is acted on. While the master waits for
+        # workers to exit (Cluster#stop_workers -> #wait_workers) it re-sends
+        # TERM to every live worker every 0.2s. Acting on each one would write
+        # STOP to the server's @notify pipe from trap context again and again,
+        # and one of those writes can overlap the server thread's
+        # `@notify.close` in Server#handle_servers. On Ruby 3.3 and 3.4, an
+        # IO#close that interrupts a trap-context write on the same IO is never
+        # woken, so the worker hangs in IO#close until the master KILLs it at
+        # worker_shutdown_timeout. A TERM always ends the worker (it pushes
+        # `false` onto restart_server), so the repeats carry no information,
+        # except that they used to retry a stop that the first TERM delivered
+        # before the server was running; the loop below covers that case.
+        term_received = false
+
         Signal.trap "SIGTERM" do
+          next if term_received
+          term_received = true
+
           @worker_write << "#{Puma::Const::PipeRequest::EXTERNAL_TERM}#{Process.pid}\n" rescue nil
           restart_server.clear
           server.stop
@@ -115,6 +132,13 @@ module Puma
 
         while restart_server.pop
           server_thread = server.run
+
+          # The trap runs on this thread. If the first TERM landed before
+          # server.run created the notify pipe, its Server#stop was a no-op
+          # (notify_safely rescues the nil @notify), and since the trap only
+          # acts once, no later TERM would stop the server. Stop it here, from
+          # outside trap context.
+          server.stop if term_received
 
           if @log_writer.debug? && index == 0
             debug_loaded_extensions "Loaded Extensions - worker 0:"

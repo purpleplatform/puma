@@ -160,6 +160,65 @@ class TestIntegrationCluster < TestIntegration
     assert_empty zombies, "Process ids #{zombies} became zombies"
   end
 
+  # While a worker drains, the master re-sends TERM every 0.2s
+  # (Cluster#wait_workers). The worker must act only on the first one: each
+  # extra Server#stop writes @notify from trap context, which can race the
+  # server thread's @notify.close and hang IO#close on Ruby 3.3 and 3.4.
+  def test_term_worker_acts_on_first_term_only
+    skip_unless_signal_exist? :TERM
+
+    cli_server "-w #{workers}", config: <<~RUBY
+      Puma::Server.prepend(Module.new do
+        def stop(*)
+          $stdout.syswrite "server stop called pid=\#{Process.pid}\\n"
+          super
+        end
+      end)
+      app do |_env|
+        $stdout.syswrite "request started pid=\#{Process.pid}\\n"
+        sleep 1.5
+        [200, {}, ["done"]]
+      end
+    RUBY
+
+    worker_pids = get_worker_pids
+    sock = connect
+    busy_pid = wait_for_server_to_match(/request started pid=(\d+)/, 1).to_i
+    assert_includes worker_pids, busy_pid
+
+    Process.kill :TERM, @pid
+    assert_equal 'done', read_body(sock, 10)
+    Process.wait @pid
+    out = @server.read
+    @server.close
+    @server = nil
+
+    stop_calls = out.scan(/server stop called pid=(\d+)/).flatten.map(&:to_i).tally
+    # The busy worker was serving a request, so its server was running when
+    # the first TERM arrived, and it drained for ~1.5s, so it received several
+    # more. Only the busy worker is checked: the idle one may still be inside
+    # server.run when TERM arrives (the master logs "booted" before that), in
+    # which case Worker#run legitimately stops it a second time, outside
+    # trap context.
+    assert_equal 1, stop_calls[busy_pid], "Server#stop calls per worker pid: #{stop_calls}"
+  end
+
+  # A TERM that reaches a worker after it reports booted but before
+  # server.run has created the notify pipe makes the trap's Server#stop a
+  # no-op. The worker must still stop, even though it ignores later TERMs.
+  def test_term_worker_right_after_boot
+    skip_unless_signal_exist? :TERM
+
+    cli_server "-w #{workers} test/rackup/hello.ru"
+    get_worker_pids
+
+    t0 = Process.clock_gettime Process::CLOCK_MONOTONIC
+    stop_server
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
+
+    assert_operator elapsed, :<, 10, "workers took #{elapsed.round(1)}s to stop"
+  end
+
   # mimicking stuck workers, test respawn with external TERM
   def test_stuck_external_term_spawn
     skip_unless_signal_exist? :TERM
