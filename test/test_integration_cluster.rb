@@ -193,7 +193,8 @@ class TestIntegrationCluster < TestIntegration
     @server.close
     @server = nil
 
-    stop_calls = out.scan(/server stop called pid=(\d+)/).flatten.map(&:to_i).tally
+    stop_calls = Hash.new(0) # not Array#tally: Ruby 2.4 is in the matrix
+    out.scan(/server stop called pid=(\d+)/).each { |(pid)| stop_calls[pid.to_i] += 1 }
     # The busy worker was serving a request, so its server was running when
     # the first TERM arrived, and it drained for ~1.5s, so it received several
     # more. Only the busy worker is checked: the idle one may still be inside

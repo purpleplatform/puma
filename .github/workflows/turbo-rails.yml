@@ -81,4 +81,5 @@ jobs:
 
       - name: turbo-rails test
         id: test
-        run: bin/test test/**/*_test.rb -vd
+        # minitest 6 (resolved by turbo-rails) dropped -d
+        run: bin/test test/**/*_test.rb -v
