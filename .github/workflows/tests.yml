@@ -44,6 +44,10 @@ jobs:
         rack-v: ['']
         yjit: ['']
         include:
+          # Ruby 3.4 is what api runs (ruby-base-image). Only these OS images
+          # still have runners, so 3.4 isn't in the `ruby` list above.
+          - { os: ubuntu-22.04 , ruby: 3.4 }
+          - { os: windows-2022 , ruby: 3.4 }
           - { os: windows-2022 , ruby: ucrt }
           - { os: windows-2022 , ruby: mswin }
           - { os: windows-2022 , ruby: 2.7  , no-ssl: ' no SSL' }
