@@ -4,6 +4,8 @@ require_relative "helper"
 require_relative "helpers/integration"
 
 require "puma/plugin"
+require "puma/configuration"
+require "puma/launcher"
 
 class TestPluginSystemdJruby < TestIntegration
 
@@ -22,14 +24,18 @@ class TestPluginSystemdJruby < TestIntegration
   end
 
   def teardown
-    super unless skipped?
+    return if skipped?
+    ENV.delete "NOTIFY_SOCKET"
+    super
   end
 
+  # Launcher#initialize adds the systemd plugin when NOTIFY_SOCKET is set,
+  # except on JRuby. Check the launcher's own plugin loader: the global
+  # Puma::Plugins registry also holds plugins that other tests in this process
+  # loaded (TestCLI#test_plugins loads systemd), so it depends on test order.
   def test_systemd_plugin_not_loaded
-    cli_server "test/rackup/hello.ru"
+    launcher = Puma::Launcher.new Puma::Configuration.new, log_writer: Puma::LogWriter.strings
 
-    assert_nil Puma::Plugins.instance_variable_get(:@plugins)["systemd"]
-
-    stop_server
+    assert_empty launcher.config.plugins.instance_variable_get(:@instances)
   end
 end
