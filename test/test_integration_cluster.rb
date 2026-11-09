@@ -161,16 +161,17 @@ class TestIntegrationCluster < TestIntegration
   end
 
   # While a worker drains, the master re-sends TERM every 0.2s
-  # (Cluster#wait_workers). The worker must act only on the first one: each
-  # extra Server#stop writes @notify from trap context, which can race the
-  # server thread's @notify.close and hang IO#close on Ruby 3.3 and 3.4.
-  def test_term_worker_acts_on_first_term_only
+  # (Cluster#wait_workers), and each one runs the worker's trap. Server#stop
+  # writes @notify, and a write from trap context that overlaps the server
+  # thread's @notify.close hangs IO#close on Ruby 3.3 and 3.4 (puma/puma#3677).
+  # The trap runs on the main thread, so no Server#stop may run there.
+  def test_term_worker_stops_server_off_trap_context
     skip_unless_signal_exist? :TERM
 
     cli_server "-w #{workers}", config: <<~RUBY
       Puma::Server.prepend(Module.new do
         def stop(*)
-          $stdout.syswrite "server stop called pid=\#{Process.pid}\\n"
+          $stdout.syswrite "server stop called pid=\#{Process.pid} main=\#{Thread.current == Thread.main}\\n"
           super
         end
       end)
@@ -193,20 +194,17 @@ class TestIntegrationCluster < TestIntegration
     @server.close
     @server = nil
 
-    stop_calls = Hash.new(0) # not Array#tally: Ruby 2.4 is in the matrix
-    out.scan(/server stop called pid=(\d+)/).each { |(pid)| stop_calls[pid.to_i] += 1 }
-    # The busy worker was serving a request, so its server was running when
-    # the first TERM arrived, and it drained for ~1.5s, so it received several
-    # more. Only the busy worker is checked: the idle one may still be inside
-    # server.run when TERM arrives (the master logs "booted" before that), in
-    # which case Worker#run legitimately stops it a second time, outside
-    # trap context.
-    assert_equal 1, stop_calls[busy_pid], "Server#stop calls per worker pid: #{stop_calls}"
+    calls = out.scan(/server stop called pid=(\d+) main=(true|false)/)
+    busy_calls = calls.select { |(pid, _)| pid.to_i == busy_pid }
+    # The busy worker drained for ~1.5s, so it received several TERMs.
+    assert_operator busy_calls.size, :>, 1, "Server#stop calls: #{calls}"
+    assert_equal [], calls.select { |(_, main)| main == "true" }, "Server#stop ran on the main thread (trap context)"
   end
 
   # A TERM that reaches a worker after it reports booted but before
-  # server.run has created the notify pipe makes the trap's Server#stop a
-  # no-op. The worker must still stop, even though it ignores later TERMs.
+  # server.run has created the notify pipe makes that Server#stop a no-op
+  # (notify_safely rescues the nil @notify). The master's repeated TERMs must
+  # still stop it.
   def test_term_worker_right_after_boot
     skip_unless_signal_exist? :TERM
 

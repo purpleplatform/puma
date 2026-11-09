@@ -133,7 +133,10 @@ class TestLogWriter < Minitest::Test
 
     sock = TCPSocket.new host, port
     path = "/"
-    params = "a" * (1024 * 1024 + 1) # over PUMA_QUERY_STRING_MAX_LENGTH (raised to 1 MB in this fork)
+    # Puma::Client raises once the parsed bytes pass MAX_HEADER (112 KB,
+    # client.rb), before the parser reaches PUMA_QUERY_STRING_MAX_LENGTH (1 MB
+    # in this fork), so MAX_HEADER is the limit this request trips.
+    params = "a" * (1024 * 1024 + 1)
 
     begin
       sock << "GET #{path}?a=#{params} HTTP/1.1\r\nConnection: close\r\n\r\n"
