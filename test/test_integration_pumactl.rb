@@ -160,8 +160,8 @@ class TestIntegrationPumactl < TestIntegration
       Puma::ControlCLI.new(%W!-p #{safe_pid} stop!, sout).run
     end
     sout.rewind
-    # windows bad URI(is not URI?)
-    assert_match(/No pid '\d+' found|bad URI\(is not URI\?\)/, sout.readlines.join(""))
+    # windows bad URI(is not URI?); Ruby 3.4+: bad URI (is not URI?)
+    assert_match(/No pid '\d+' found|bad URI ?\(is not URI\?\)/, sout.readlines.join(""))
     assert_equal(1, e.status)
   end
 

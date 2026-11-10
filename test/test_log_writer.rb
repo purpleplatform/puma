@@ -133,10 +133,16 @@ class TestLogWriter < Minitest::Test
 
     sock = TCPSocket.new host, port
     path = "/"
-    params = "a"*1024*10
+    # Puma::Client raises once the parsed bytes pass MAX_HEADER (112 KB,
+    # client.rb), before the parser reaches PUMA_QUERY_STRING_MAX_LENGTH (1 MB
+    # in this fork), so MAX_HEADER is the limit this request trips.
+    params = "a" * (1024 * 1024 + 1)
 
-    sock << "GET #{path}?a=#{params} HTTP/1.1\r\nConnection: close\r\n\r\n"
-    sock.read
+    begin
+      sock << "GET #{path}?a=#{params} HTTP/1.1\r\nConnection: close\r\n\r\n"
+      sock.read
+    rescue Errno::ECONNRESET, Errno::EPIPE # Puma closes before reading the whole oversized request
+    end
     sleep 0.1 # important so that the previous data is sent as a packet
     assert_match %r!HTTP parse error, malformed request!, log_writer.stderr.string
     assert_match %r!\("GET #{path}" - \(-\)\)!, log_writer.stderr.string

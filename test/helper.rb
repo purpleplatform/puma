@@ -83,7 +83,7 @@ module TimeoutEveryTestCase
   end
 
   def run
-    with_info_handler do
+    run_with_info_handler do
       time_it do
         capture_exceptions do
           ::Timeout.timeout($test_case_timeout, TestTookTooLong) do
@@ -104,6 +104,14 @@ module TimeoutEveryTestCase
     end
 
     Minitest::Result.from self # per contract
+  end
+
+  private
+
+  # minitest 5.22 removed Test#with_info_handler (prints the running test on
+  # SIGINFO). Use it where it exists so older Rubies keep that behavior.
+  def run_with_info_handler(&block)
+    respond_to?(:with_info_handler, true) ? with_info_handler(&block) : yield
   end
 end
 

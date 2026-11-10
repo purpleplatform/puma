@@ -207,7 +207,9 @@ class TestThreadPool < Minitest::Test
 
     pool.trim
     assert_equal 0, pool.spawned
-    assert_equal 1, exited.length
+    # The exiting thread runs the hook just after it decrements spawned, so
+    # wait for it rather than reading the queue length right away.
+    assert_equal 1, Timeout.timeout(5) { exited.pop }
   end
 
   def test_autotrim

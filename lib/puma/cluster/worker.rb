@@ -101,7 +101,17 @@ module Puma
         Signal.trap "SIGTERM" do
           @worker_write << "#{Puma::Const::PipeRequest::EXTERNAL_TERM}#{Process.pid}\n" rescue nil
           restart_server.clear
-          server.stop
+          # Write STOP from a thread, never from trap context. On Ruby 3.3 and
+          # 3.4, if a trap-context write to @notify overlaps the server
+          # thread's `@notify.close` (Server#handle_servers), the closer is
+          # never woken and the worker hangs in IO#close until the master KILLs
+          # it at worker_shutdown_timeout. The master re-sends TERM every 0.2s
+          # while it waits (Cluster#wait_workers), which makes the overlap
+          # likely. This is puma/puma#3677. Its upstream fix, puma/puma#3940,
+          # switches notify_safely to syswrite, which still hangs when the
+          # write comes from trap context, so keep this if this fork moves to
+          # a Puma that includes #3940.
+          Thread.new { server.stop }
           restart_server << false
         end
 

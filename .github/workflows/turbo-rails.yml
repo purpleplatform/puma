@@ -29,7 +29,9 @@ jobs:
           - { os: ubuntu-20.04 , ruby: '3.1', rails: '7.0' }
           - { os: ubuntu-20.04 , ruby: '3.2', rails: '7.0' }
           - { os: ubuntu-22.04 , ruby: '3.3', rails: '7.0' }
-          - { os: ubuntu-22.04 , ruby: head , rails: '7.0' }
+          # Rails 7.0 doesn't support Ruby 4 (head fails loading tsort). 3.4 is
+          # what api runs.
+          - { os: ubuntu-22.04 , ruby: '3.4', rails: '7.0' }
     env:
       CI: true
       RAILS_VERSION: "${{ matrix.rails }}"
@@ -39,7 +41,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: hotwired/turbo-rails
-          ref: main
+          # turbo-rails main now requires railties >= 7.1 and Ruby >= 3.1, which
+          # this matrix (Rails 6.1/7.0) can't resolve. v1.5.0 was current when
+          # Puma 6.4.2 was released and supports railties >= 6.0.
+          ref: v1.5.0
 
       - name: turbo-rails updates
         run: |
@@ -47,6 +52,10 @@ jobs:
           SRC="gem ['\"]puma['\"].*"
           DST="gem 'puma', git: 'https://github.com/$GITHUB_REPOSITORY.git', ref: '$GITHUB_SHA'"
           sed -i "s#$SRC#$DST#" Gemfile
+          #
+          # Rails 7.0's sqlite3 adapter needs sqlite3 ~> 1.4; v1.5.0's Gemfile
+          # leaves it unpinned, so Bundler picks 2.x and the adapter fails to load
+          sed -i "s/gem 'sqlite3'$/gem 'sqlite3', '~> 1.4'/" Gemfile
           #
           # allow using capybara from the repo, either a branch or a commit
           # comment out if CI works with current release
@@ -72,4 +81,5 @@ jobs:
 
       - name: turbo-rails test
         id: test
-        run: bin/test test/**/*_test.rb -vd
+        # minitest 6 (resolved by turbo-rails) dropped -d
+        run: bin/test test/**/*_test.rb -v
